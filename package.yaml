@@ -1,0 +1,8 @@
+name: "nav_localization"
+version: "0.1.0"
+description: "Navigation localization powered by ScanContext"
+maintainers:
+  - name: "fins"
+    email: "fins@sjtu.edu.cn"
+licenses:
+  - "MIT"
