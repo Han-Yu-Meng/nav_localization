@@ -119,7 +119,7 @@ public:
 
   void on_cloud(const fins::Msg<pcl::PointCloud<pcl::PointXYZI>::Ptr> &msg) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto current_cloud = (*msg.data);
+    auto current_cloud = *msg;
 
     if (!current_cloud || current_cloud->empty() || keyframes_.empty())
       return;
