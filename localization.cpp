@@ -173,7 +173,7 @@ public:
       }
       last_localized_pose_ = current_pos;
 
-      publish_results(final_pose, current_cloud, msg.event_time);
+      publish_results(final_pose, current_cloud, msg.acq_time);
 
       logger->info("Localized: Frame[{}] Pose[{:.2f}, {:.2f}, {:.2f}]", match_idx, current_pos.x(), current_pos.y(),
                    current_pos.z());
@@ -453,7 +453,7 @@ private:
 
 
   void publish_results(const Eigen::Matrix4d &pose, pcl::PointCloud<pcl::PointXYZI>::Ptr cloud,
-                       fins::time_stamp event_time) {
+                       fins::AcqTime acq_time) {
     Eigen::Vector3d t = pose.block<3, 1>(0, 3);
     Eigen::Quaterniond q(pose.block<3, 3>(0, 0));
 
@@ -470,7 +470,7 @@ private:
       tf_msg.transform.rotation.y = q.y();
       tf_msg.transform.rotation.z = q.z();
       tf_msg.transform.rotation.w = q.w();
-      send<0>(tf_msg, event_time);
+      send<0>(tf_msg, acq_time);
     }
 
     // 2. Path
@@ -490,7 +490,7 @@ private:
         global_path_.poses.erase(global_path_.poses.begin());
 
       global_path_.header.stamp = ps.header.stamp;
-      send<1>(global_path_, event_time);
+      send<1>(global_path_, acq_time);
     }
 
     // 3. Aligned Cloud
@@ -499,7 +499,7 @@ private:
       pcl::transformPointCloud(*cloud, *aligned, pose);
       aligned->header.frame_id = "map";
       aligned->header.stamp = cloud->header.stamp;
-      send<3>(aligned, event_time);
+      send<3>(aligned, acq_time);
     }
   }
 
