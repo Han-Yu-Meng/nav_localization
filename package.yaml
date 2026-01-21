@@ -4,5 +4,13 @@ description: "Navigation localization powered by ScanContext"
 maintainers:
   - name: "fins"
     email: "fins@sjtu.edu.cn"
+depends:
+  PCL: "system"
+  OpenCV: "system"
+
+  nav_msgs: "system"
+  geometry_msgs: "system"
+  cv_bridge: "system"
+  pcl_conversions: "system"
 licenses:
   - "MIT"

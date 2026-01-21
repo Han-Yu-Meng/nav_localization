@@ -41,7 +41,7 @@ struct KeyFrame {
 struct Config {
   std::string map_dir;
   std::string child_frame_id = "livox_frame";
-  double sc_dist_thres = 0.20;
+  double sc_dist_thres = 0.50;
   double icp_max_dist = 1.0;
   double icp_score_thres = 0.2;
   bool use_icp = true;
@@ -52,7 +52,7 @@ public:
   void define() override {
     set_name("ScanContextNode");
     set_description("Robust Global Localization using SC + Centroid-ICP");
-    set_category("Navigation");
+    set_category("Navigation>Localization");
 
     register_input<0, pcl::PointCloud<pcl::PointXYZI>::Ptr>("cloud", &ScanContextNode::on_cloud);
 
@@ -301,9 +301,16 @@ private:
       }
     }
 
-    if (best_idx != -1 && min_dist < config_.sc_dist_thres) {
-      float yaw_rad = deg2rad(best_align * sc_manager_->PC_UNIT_SECTORANGLE);
-      return {best_idx, yaw_rad};
+    if (best_idx != -1) {
+      logger->info("SC Search: Best Candidate Frame[{}] Dist: {:.4f} (Thres: {:.2f})", 
+                    best_idx, min_dist, config_.sc_dist_thres);
+      
+      if (min_dist < config_.sc_dist_thres) {
+        float yaw_rad = deg2rad(best_align * sc_manager_->PC_UNIT_SECTORANGLE);
+        return {best_idx, yaw_rad};
+      }
+    } else {
+      logger->warn("SC Search: No candidates found in KD-Tree.");
     }
     return {-1, 0.0f};
   }
