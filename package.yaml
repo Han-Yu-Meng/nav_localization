@@ -12,5 +12,14 @@ depends:
   geometry_msgs: "system"
   cv_bridge: "system"
   pcl_conversions: "system"
+  
+  small_gicp: "1.0.0"
+recipes:
+  small_gicp:
+    git: "https://github.com/koide3/small_gicp.git"
+    build_system: "cmake"
+    versions:
+      "1.0.0":
+        tag: "v1.0.0"
 licenses:
   - "MIT"
