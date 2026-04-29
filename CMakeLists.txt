@@ -6,7 +6,7 @@ find_package(PCL        REQUIRED)
 find_package(OpenCV     REQUIRED)
 find_package(small_gicp REQUIRED)
 
-fins_add_node(${PROJECT_NAME} SHARED relocalization.cpp)
+fins_add_node(${PROJECT_NAME} nodes.cpp)
 
 target_include_directories(${PROJECT_NAME} PRIVATE
   ${PCL_INCLUDE_DIRS} 

@@ -57,6 +57,28 @@ MatrixXd circshift( MatrixXd &_mat, int _num_shift )
 
 } // circshift
 
+void showScanContext(std::string winname, const Eigen::MatrixXd& _sc) {
+    cv::Mat mat;
+    cv::eigen2cv(_sc, mat);
+
+    double minVal, maxVal;
+    cv::minMaxLoc(mat, &minVal, &maxVal);
+    cv::Mat mat_8u;
+    if (maxVal - minVal > 0) {
+        mat.convertTo(mat_8u, CV_8U, 255.0 / (maxVal - minVal), -minVal * 255.0 / (maxVal - minVal));
+    } else {
+        mat_8u = cv::Mat::zeros(mat.size(), CV_8U);
+    }
+
+    cv::Mat color_mat;
+    cv::applyColorMap(mat_8u, color_mat, cv::COLORMAP_JET);
+
+    cv::Mat resized_mat;
+    cv::resize(color_mat, resized_mat, cv::Size(), 10, 10, cv::INTER_NEAREST);
+
+    cv::imshow(winname, resized_mat);
+}
+
 
 std::vector<float> eig2stdvec( MatrixXd _eigmat )
 {
@@ -309,6 +331,23 @@ std::pair<int, float> SCManager::detectLoopClosureID ( void )
         }
     }
     t_calc_dist.toc("Distance calc");
+
+    if( nn_idx > 0 )
+    {
+        MatrixXd best_candidate_sc = polarcontexts_[nn_idx];
+        
+        auto res = distanceBtnScanContext(curr_desc, best_candidate_sc);
+        int best_align = res.second;
+        MatrixXd aligned_candidate_sc = circshift(best_candidate_sc, best_align);
+
+        showScanContext("Query SC", curr_desc);
+        showScanContext("Best Candidate (Aligned)", aligned_candidate_sc);
+        
+        MatrixXd diff = (curr_desc - aligned_candidate_sc).cwiseAbs();
+        showScanContext("Difference Map", diff);
+
+        cv::waitKey(1);
+    }
 
     /* 
      * loop threshold check

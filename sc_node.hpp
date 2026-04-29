@@ -4,15 +4,13 @@
  * All rights reserved.
  ******************************************************************************/
 
-#include <fins/node.hpp>
-#include "Scancontext.hpp"
-
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <pcl/common/centroid.h>
 #include <pcl/common/common.h>
 #include <pcl/common/transforms.h>
 #include <pcl/features/normal_3d_omp.h>
+#include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -22,6 +20,48 @@
 
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
+#include <unordered_map>
+#include <vector>
+namespace flann {
+namespace serialization {
+
+// 首先声明基础模板，防止编译器找不到
+template <typename T> struct Serializer;
+
+// 为 std::unordered_map 提供特化
+template <typename K, typename V> struct Serializer<std::unordered_map<K, V>> {
+  // 注意：save 和 load 函数本身必须是模板，以接收不同的 Archive 类型
+  template <typename Archive>
+  static void save(Archive &ar, const std::unordered_map<K, V> &map) {
+    size_t size = map.size();
+    ar &size;
+    for (auto const &kv : map) {
+      ar &kv.first;
+      ar &kv.second;
+    }
+  }
+
+  template <typename Archive>
+  static void load(Archive &ar, std::unordered_map<K, V> &map) {
+    size_t size;
+    ar &size;
+    map.clear();
+    for (size_t i = 0; i < size; ++i) {
+      K key;
+      V val;
+      ar &key;
+      ar &val;
+      map[key] = val;
+    }
+  }
+};
+
+} // namespace serialization
+} // namespace flann
+
+#include "Scancontext.hpp"
+#include <fins/node.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <filesystem>
@@ -30,6 +70,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+namespace SC_Node {
 
 struct KeyFrame {
   int id;
@@ -40,7 +82,7 @@ struct KeyFrame {
 
 struct Config {
   std::string map_dir;
-  std::string child_frame_id = "livox_frame";
+  std::string child_frame_id = "lidar_link";
   double sc_dist_thres = 0.50;
   double icp_max_dist = 1.0;
   double icp_score_thres = 0.2;
@@ -54,16 +96,33 @@ public:
     set_description("Robust Global Localization using SC + Centroid-ICP");
     set_category("Navigation>Localization");
 
-    register_input<0, pcl::PointCloud<pcl::PointXYZI>::Ptr>("cloud", &ScanContextNode::on_cloud);
+    register_input<0, pcl::PointCloud<pcl::PointXYZI>::Ptr>(
+        "cloud", &ScanContextNode::on_cloud);
 
     register_output<0, geometry_msgs::msg::TransformStamped>("tf");
     register_output<1, nav_msgs::msg::Path>("path");
     register_output<2, pcl::PointCloud<pcl::PointXYZRGB>::Ptr>("global_map");
     register_output<3, pcl::PointCloud<pcl::PointXYZI>::Ptr>("aligned_cloud");
 
-    register_parameter<std::string>("map_dir", &ScanContextNode::update_map_dir, "/path/to/map");
-    register_parameter<double>("dist_threshold", &ScanContextNode::update_dist_thres, 0.20);
+    register_parameter<std::string>("map_dir", &ScanContextNode::update_map_dir,
+                                    "/path/to/map");
+    register_parameter<double>("dist_threshold",
+                               &ScanContextNode::update_dist_thres, 0.20);
     register_parameter<bool>("use_icp", &ScanContextNode::update_use_icp, true);
+  }
+
+  pcl::PointCloud<pcl::PointXYZI>::Ptr
+  remove_outliers(pcl::PointCloud<pcl::PointXYZI>::Ptr cloud) {
+    pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_filtered(
+        new pcl::PointCloud<pcl::PointXYZI>);
+
+    pcl::StatisticalOutlierRemoval<pcl::PointXYZI> sor;
+    sor.setInputCloud(cloud);
+    sor.setMeanK(50);
+    sor.setStddevMulThresh(2.0);
+    sor.filter(*cloud_filtered);
+
+    return cloud_filtered;
   }
 
   void initialize() override {
@@ -83,7 +142,8 @@ public:
       while (is_running_) {
         {
           std::lock_guard<std::mutex> lock(mutex_);
-          if (required<2>() && global_map_cloud_viz_ && !global_map_cloud_viz_->empty()) {
+          if (required<2>() && global_map_cloud_viz_ &&
+              !global_map_cloud_viz_->empty()) {
             send<2>(global_map_cloud_viz_, fins::now());
           }
         }
@@ -124,6 +184,8 @@ public:
     if (!current_cloud || current_cloud->empty() || keyframes_.empty())
       return;
 
+    current_cloud = remove_outliers(current_cloud);
+
     // Step 1: Scan Context Coarse Matching (Global Retrieval)
     // Returns: <Index, Yaw_Rotation_Rad>
     auto [match_idx, yaw_diff] = match_scancontext(current_cloud);
@@ -143,11 +205,11 @@ public:
       Eigen::Matrix4d T_keyframe_current;
       double score = 0.0;
 
-      bool icp_ok = refine_with_icp(current_cloud, // Source
+      bool icp_ok = refine_with_icp(current_cloud,               // Source
                                     keyframes_[match_idx].cloud, // Target
-                                    yaw_diff, // Initial Yaw Guess
+                                    yaw_diff,           // Initial Yaw Guess
                                     T_keyframe_current, // Output Transform
-                                    score // Output Score
+                                    score               // Output Score
       );
 
       if (icp_ok) {
@@ -175,7 +237,8 @@ public:
 
       publish_results(final_pose, current_cloud, msg.acq_time);
 
-      logger->info("Localized: Frame[{}] Pose[{:.2f}, {:.2f}, {:.2f}]", match_idx, current_pos.x(), current_pos.y(),
+      logger->info("Localized: Frame[{}] Pose[{:.2f}, {:.2f}, {:.2f}]",
+                   match_idx, current_pos.x(), current_pos.y(),
                    current_pos.z());
     }
   }
@@ -205,7 +268,7 @@ private:
       return false;
 
     std::vector<std::string> pcd_files;
-    for (const auto &entry: fs::directory_iterator(dir_path)) {
+    for (const auto &entry : fs::directory_iterator(dir_path)) {
       if (entry.path().extension() == ".pcd") {
         pcd_files.push_back(entry.path().stem().string());
       }
@@ -230,6 +293,8 @@ private:
       if (pcl::io::loadPCDFile(pcd_path, *kf.cloud) == -1)
         continue;
 
+      kf.cloud = remove_outliers(kf.cloud);
+
       kf.pose = Eigen::Matrix4d::Identity();
       if (fs::exists(odom_path)) {
         std::ifstream file(odom_path);
@@ -246,7 +311,7 @@ private:
       uint8_t r = (i * 30) % 255;
       uint8_t g = (i * 100) % 255;
       uint8_t b = 200;
-      for (auto &p: viz_cloud.points) {
+      for (auto &p : viz_cloud.points) {
         p.r = r;
         p.g = g;
         p.b = b;
@@ -265,26 +330,31 @@ private:
     global_map_cloud_viz_->header.frame_id = "map";
 
     if (!sc_manager_->polarcontext_invkeys_mat_.empty()) {
-      sc_manager_->polarcontext_invkeys_to_search_ = sc_manager_->polarcontext_invkeys_mat_;
-      sc_manager_->polarcontext_tree_ =
-          std::make_unique<InvKeyTree>(sc_manager_->PC_NUM_RING, sc_manager_->polarcontext_invkeys_to_search_, 10);
+      sc_manager_->polarcontext_invkeys_to_search_ =
+          sc_manager_->polarcontext_invkeys_mat_;
+      sc_manager_->polarcontext_tree_ = std::make_unique<InvKeyTree>(
+          sc_manager_->PC_NUM_RING,
+          sc_manager_->polarcontext_invkeys_to_search_, 10);
     }
 
     logger->info("Map loaded. {} keyframes.", keyframes_.size());
     return true;
   }
 
-  std::pair<int, float> match_scancontext(pcl::PointCloud<pcl::PointXYZI>::Ptr cloud) {
+  std::pair<int, float>
+  match_scancontext(pcl::PointCloud<pcl::PointXYZI>::Ptr cloud) {
     Eigen::MatrixXd sc = sc_manager_->makeScancontext(*cloud);
     Eigen::MatrixXd ringkey = sc_manager_->makeRingkeyFromScancontext(sc);
     std::vector<float> query_key = eig2stdvec(ringkey);
 
-    int candidates = std::min((int) keyframes_.size(), (int) sc_manager_->NUM_CANDIDATES_FROM_TREE);
+    int candidates = std::min((int)keyframes_.size(),
+                              (int)sc_manager_->NUM_CANDIDATES_FROM_TREE);
     std::vector<size_t> indices(candidates);
     std::vector<float> dists(candidates);
     nanoflann::KNNResultSet<float> result(candidates);
     result.init(&indices[0], &dists[0]);
-    sc_manager_->polarcontext_tree_->index->findNeighbors(result, &query_key[0], nanoflann::SearchParams(10));
+    sc_manager_->polarcontext_tree_->index->findNeighbors(
+        result, &query_key[0], nanoflann::SearchParams(10));
 
     double min_dist = 1e9;
     int best_idx = -1;
@@ -292,7 +362,8 @@ private:
 
     for (int i = 0; i < candidates; ++i) {
       int map_id = indices[i];
-      auto [dist, align] = sc_manager_->distanceBtnScanContext(sc, sc_manager_->polarcontexts_[map_id]);
+      auto [dist, align] = sc_manager_->distanceBtnScanContext(
+          sc, sc_manager_->polarcontexts_[map_id]);
 
       if (dist < min_dist) {
         min_dist = dist;
@@ -302,9 +373,10 @@ private:
     }
 
     if (best_idx != -1) {
-      logger->info("SC Search: Best Candidate Frame[{}] Dist: {:.4f} (Thres: {:.2f})", 
-                    best_idx, min_dist, config_.sc_dist_thres);
-      
+      logger->info(
+          "SC Search: Best Candidate Frame[{}] Dist: {:.4f} (Thres: {:.2f})",
+          best_idx, min_dist, config_.sc_dist_thres);
+
       if (min_dist < config_.sc_dist_thres) {
         float yaw_rad = deg2rad(best_align * sc_manager_->PC_UNIT_SECTORANGLE);
         return {best_idx, yaw_rad};
@@ -315,14 +387,18 @@ private:
     return {-1, 0.0f};
   }
 
-  bool refine_with_icp(pcl::PointCloud<pcl::PointXYZI>::Ptr src_cloud, pcl::PointCloud<pcl::PointXYZI>::Ptr tgt_cloud,
-                       float yaw_guess, Eigen::Matrix4d &result_pose, double &final_score) {
+  bool refine_with_icp(pcl::PointCloud<pcl::PointXYZI>::Ptr src_cloud,
+                       pcl::PointCloud<pcl::PointXYZI>::Ptr tgt_cloud,
+                       float yaw_guess, Eigen::Matrix4d &result_pose,
+                       double &final_score) {
     pcl::VoxelGrid<pcl::PointXYZI> vg;
     pcl::NormalEstimationOMP<pcl::PointXYZI, pcl::PointNormal> ne;
-    pcl::search::KdTree<pcl::PointXYZI>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZI>());
+    pcl::search::KdTree<pcl::PointXYZI>::Ptr tree(
+        new pcl::search::KdTree<pcl::PointXYZI>());
     ne.setSearchMethod(tree);
 
-    pcl::IterativeClosestPointWithNormals<pcl::PointNormal, pcl::PointNormal> icp;
+    pcl::IterativeClosestPointWithNormals<pcl::PointNormal, pcl::PointNormal>
+        icp;
     pcl::PointCloud<pcl::PointNormal> unused_res;
 
     Eigen::Matrix4f current_guess = Eigen::Matrix4f::Identity();
@@ -334,8 +410,10 @@ private:
     // Voxel: 0.5m | Radius: 2.0m | Dist: 2.5m
     // =======================================================
     {
-      pcl::PointCloud<pcl::PointXYZI>::Ptr src_s1(new pcl::PointCloud<pcl::PointXYZI>);
-      pcl::PointCloud<pcl::PointXYZI>::Ptr tgt_s1(new pcl::PointCloud<pcl::PointXYZI>);
+      pcl::PointCloud<pcl::PointXYZI>::Ptr src_s1(
+          new pcl::PointCloud<pcl::PointXYZI>);
+      pcl::PointCloud<pcl::PointXYZI>::Ptr tgt_s1(
+          new pcl::PointCloud<pcl::PointXYZI>);
 
       vg.setLeafSize(0.5f, 0.5f, 0.5f);
       vg.setInputCloud(src_cloud);
@@ -346,8 +424,10 @@ private:
       if (src_s1->size() < 10 || tgt_s1->size() < 10)
         return false;
 
-      pcl::PointCloud<pcl::PointNormal>::Ptr src_n(new pcl::PointCloud<pcl::PointNormal>);
-      pcl::PointCloud<pcl::PointNormal>::Ptr tgt_n(new pcl::PointCloud<pcl::PointNormal>);
+      pcl::PointCloud<pcl::PointNormal>::Ptr src_n(
+          new pcl::PointCloud<pcl::PointNormal>);
+      pcl::PointCloud<pcl::PointNormal>::Ptr tgt_n(
+          new pcl::PointCloud<pcl::PointNormal>);
 
       ne.setRadiusSearch(2.0);
       ne.setInputCloud(src_s1);
@@ -373,8 +453,10 @@ private:
     // Voxel: 0.2m | Radius: 0.8m | Dist: 0.5m
     // =======================================================
     {
-      pcl::PointCloud<pcl::PointXYZI>::Ptr src_s2(new pcl::PointCloud<pcl::PointXYZI>);
-      pcl::PointCloud<pcl::PointXYZI>::Ptr tgt_s2(new pcl::PointCloud<pcl::PointXYZI>);
+      pcl::PointCloud<pcl::PointXYZI>::Ptr src_s2(
+          new pcl::PointCloud<pcl::PointXYZI>);
+      pcl::PointCloud<pcl::PointXYZI>::Ptr tgt_s2(
+          new pcl::PointCloud<pcl::PointXYZI>);
 
       vg.setLeafSize(0.2f, 0.2f, 0.2f);
       vg.setInputCloud(src_cloud);
@@ -382,8 +464,10 @@ private:
       vg.setInputCloud(tgt_cloud);
       vg.filter(*tgt_s2);
 
-      pcl::PointCloud<pcl::PointNormal>::Ptr src_n(new pcl::PointCloud<pcl::PointNormal>);
-      pcl::PointCloud<pcl::PointNormal>::Ptr tgt_n(new pcl::PointCloud<pcl::PointNormal>);
+      pcl::PointCloud<pcl::PointNormal>::Ptr src_n(
+          new pcl::PointCloud<pcl::PointNormal>);
+      pcl::PointCloud<pcl::PointNormal>::Ptr tgt_n(
+          new pcl::PointCloud<pcl::PointNormal>);
 
       ne.setRadiusSearch(0.8);
       ne.setInputCloud(src_s2);
@@ -409,8 +493,10 @@ private:
     // Voxel: 0.05m | Radius: 0.3m | Dist: 0.1m
     // =======================================================
     {
-      pcl::PointCloud<pcl::PointXYZI>::Ptr src_s3(new pcl::PointCloud<pcl::PointXYZI>);
-      pcl::PointCloud<pcl::PointXYZI>::Ptr tgt_s3(new pcl::PointCloud<pcl::PointXYZI>);
+      pcl::PointCloud<pcl::PointXYZI>::Ptr src_s3(
+          new pcl::PointCloud<pcl::PointXYZI>);
+      pcl::PointCloud<pcl::PointXYZI>::Ptr tgt_s3(
+          new pcl::PointCloud<pcl::PointXYZI>);
 
       vg.setLeafSize(0.05f, 0.05f, 0.05f);
       vg.setInputCloud(src_cloud);
@@ -418,8 +504,10 @@ private:
       vg.setInputCloud(tgt_cloud);
       vg.filter(*tgt_s3);
 
-      pcl::PointCloud<pcl::PointNormal>::Ptr src_n(new pcl::PointCloud<pcl::PointNormal>);
-      pcl::PointCloud<pcl::PointNormal>::Ptr tgt_n(new pcl::PointCloud<pcl::PointNormal>);
+      pcl::PointCloud<pcl::PointNormal>::Ptr src_n(
+          new pcl::PointCloud<pcl::PointNormal>);
+      pcl::PointCloud<pcl::PointNormal>::Ptr tgt_n(
+          new pcl::PointCloud<pcl::PointNormal>);
 
       ne.setRadiusSearch(0.2);
       ne.setInputCloud(src_s3);
@@ -446,8 +534,8 @@ private:
       if (icp.hasConverged()) {
         Eigen::Matrix3d rot = result_pose.block<3, 3>(0, 0);
         Eigen::Vector3d euler = rot.eulerAngles(2, 1, 0);
-        logger->info("[ICP Ultra] Trans: {:.3f}, {:.3f} | Score: {:.5f}", result_pose(0, 3), result_pose(1, 3),
-                     final_score);
+        logger->info("[ICP Ultra] Trans: {:.3f}, {:.3f} | Score: {:.5f}",
+                     result_pose(0, 3), result_pose(1, 3), final_score);
         return true;
       }
     }
@@ -458,8 +546,8 @@ private:
     return false;
   }
 
-
-  void publish_results(const Eigen::Matrix4d &pose, pcl::PointCloud<pcl::PointXYZI>::Ptr cloud,
+  void publish_results(const Eigen::Matrix4d &pose,
+                       pcl::PointCloud<pcl::PointXYZI>::Ptr cloud,
                        fins::AcqTime acq_time) {
     Eigen::Vector3d t = pose.block<3, 1>(0, 3);
     Eigen::Quaterniond q(pose.block<3, 3>(0, 0));
@@ -502,7 +590,8 @@ private:
 
     // 3. Aligned Cloud
     if (required<3>()) {
-      pcl::PointCloud<pcl::PointXYZI>::Ptr aligned(new pcl::PointCloud<pcl::PointXYZI>);
+      pcl::PointCloud<pcl::PointXYZI>::Ptr aligned(
+          new pcl::PointCloud<pcl::PointXYZI>);
       pcl::transformPointCloud(*cloud, *aligned, pose);
       aligned->header.frame_id = "map";
       aligned->header.stamp = cloud->header.stamp;
@@ -518,4 +607,4 @@ private:
 };
 
 EXPORT_NODE(ScanContextNode)
-DEFINE_PLUGIN_ENTRY()
+} // namespace SC_Node

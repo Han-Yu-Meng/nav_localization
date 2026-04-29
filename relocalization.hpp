@@ -48,6 +48,8 @@
 #include <thread>
 #include <vector>
 
+namespace Relocalization_Node {
+
 struct KeyFrame {
   int id;
   Eigen::Matrix4d pose;
@@ -57,7 +59,7 @@ struct KeyFrame {
 struct Config {
   std::string sc_feature_dir;
   std::string global_map_path;
-  double sc_dist_thres = 0.50;
+  double sc_dist_thres = 0.40;
 
   int num_threads = 4;
   int num_neighbors = 20;
@@ -82,13 +84,12 @@ public:
   void define() override {
     set_name("RelocalizationNode");
     set_description(
-        "Relocalization: Dual Input (Odom Cloud for GICP, Lidar Cloud for SC)");
+        "Relocalization: Single Input (Odom Cloud for both SC and GICP)");
     set_category("Navigation>Localization");
 
+    // Modified: Only accept cloud_odom
     register_input<pcl::PointCloud<pcl::PointXYZI>::Ptr>(
         "cloud_odom", &RelocalizationNode::on_cloud_odom);
-    register_input<pcl::PointCloud<pcl::PointXYZI>::Ptr>(
-        "cloud_lidar", &RelocalizationNode::on_cloud_lidar);
     register_input<geometry_msgs::msg::TransformStamped>(
         "$T_{odom\\to lidar}$", &RelocalizationNode::on_transform);
 
@@ -117,6 +118,7 @@ public:
     global_map_target_ = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>();
     target_covariance_ =
         std::make_shared<pcl::PointCloud<pcl::PointCovariance>>();
+    debug_cloud.reset(new pcl::PointCloud<pcl::PointXYZI>());
 
     accumulated_cloud_lidar_.reset(new pcl::PointCloud<pcl::PointXYZI>());
     global_map_viz_.reset(new pcl::PointCloud<pcl::PointXYZRGB>());
@@ -147,13 +149,9 @@ public:
 
   ~RelocalizationNode() { stop_threads(); }
 
-  void run() override {
+  void run() override {}
 
-  }
-
-  void pause() override {
-
-  }
+  void pause() override {}
 
   void reset() override {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -201,50 +199,11 @@ public:
     }
   }
 
-  void
-  on_cloud_lidar(const fins::Msg<pcl::PointCloud<pcl::PointXYZI>::Ptr> &msg) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (state_ != SystemState::ACCUMULATING)
-      return;
-
-    auto input_cloud = *msg;
-    if (!input_cloud || input_cloud->empty())
-      return;
-
-    double current_timestamp = fins::to_seconds(msg.acq_time);
-
-    if (!accumulation_started_) {
-      start_accumulation_time_ = current_timestamp;
-      accumulation_started_ = true;
-      accumulated_cloud_lidar_->clear();
-      logger->info("[State] ACCUMULATING started (Input: Cloud Lidar)...");
-    }
-
-    double elapsed = current_timestamp - start_accumulation_time_;
-    if (elapsed < config_.accumulation_time) {
-      static pcl::VoxelGrid<pcl::PointXYZI> vg;
-      vg.setLeafSize(0.2f, 0.2f, 0.2f);
-      vg.setInputCloud(input_cloud);
-      pcl::PointCloud<pcl::PointXYZI> temp;
-      vg.filter(temp);
-      *accumulated_cloud_lidar_ += temp;
-    } else {
-      logger->info(
-          "[State] Accumulation finished. Points: {}. Running LOCALIZING...",
-          accumulated_cloud_lidar_->size());
-      state_ = SystemState::LOCALIZING;
-      perform_global_localization(msg.acq_time);
-    }
-  }
-
-  // 回调 2: 处理 Odom 系注册点云 (用于 GICP 追踪)
+  // Unified callback: Handles both Accumulating (SC) and Tracking (GICP)
   void
   on_cloud_odom(const fins::Msg<pcl::PointCloud<pcl::PointXYZI>::Ptr> &msg) {
-    // 这里不持有主锁 mutex_，只在需要读取共享状态时短暂持有
-    // 或者我们直接在这里做简单的判断
-
-    if (state_ != SystemState::TRACKING)
-      return;
+    // Acquire lock to read/write state safely
+    std::unique_lock<std::mutex> lock(mutex_);
 
     auto input_cloud = *msg;
     if (!input_cloud || input_cloud->empty())
@@ -252,45 +211,92 @@ public:
 
     double current_timestamp = fins::to_seconds(msg.acq_time);
 
-    // 1. 检查时间间隔 (> 5.0s)
-    if (current_timestamp - last_tracking_request_time_ <
-        config_.tracking_interval) {
-      return; // 还没到时间，忽略
-    }
+    // =========================================================================
+    // CASE 1: ACCUMULATING (Prepare ScanContext)
+    // =========================================================================
+    if (state_ == SystemState::ACCUMULATING) {
+      if (!accumulation_started_) {
+        start_accumulation_time_ = current_timestamp;
+        accumulation_started_ = true;
+        accumulated_cloud_lidar_->clear();
+        logger->info("[State] ACCUMULATING started (Input: Cloud Odom -> "
+                     "Converted to Local)...");
+      }
 
-    // 2. 检查工作线程是否空闲
-    // 如果正在处理，直接跳过（Drop frame），保证实时性
-    if (is_gicp_processing_) {
-      // logger->debug("[GICP] Worker busy, skipping frame.");
+      double elapsed = current_timestamp - start_accumulation_time_;
+      if (elapsed < config_.accumulation_time) {
+        // Transform Odom Cloud back to Lidar Frame for valid SC generation
+        // T_lidar_odom = T_odom_lidar^-1
+        // Eigen::Matrix4f T_lidar_odom =
+        // T_odom_lidar_.inverse().matrix().cast<float>();
+
+        // pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_local(new
+        // pcl::PointCloud<pcl::PointXYZI>());
+        // pcl::transformPointCloud(*input_cloud, *cloud_local, T_lidar_odom);
+
+        // Filter and accumulate
+        static pcl::VoxelGrid<pcl::PointXYZI> vg;
+        vg.setLeafSize(0.1f, 0.1f, 0.1f);
+        vg.setInputCloud(input_cloud);
+        pcl::PointCloud<pcl::PointXYZI> temp;
+        vg.filter(temp);
+        *accumulated_cloud_lidar_ += temp;
+      } else {
+        logger->info(
+            "[State] Accumulation finished. Points: {}. Running LOCALIZING...",
+            accumulated_cloud_lidar_->size());
+        state_ = SystemState::LOCALIZING;
+
+        // Release lock before complex computation?
+        // perform_global_localization needs the lock (it reads keyframes,
+        // sc_manager, etc), but let's call it here while we have the lock.
+        perform_global_localization(msg.acq_time);
+      }
       return;
     }
 
-    // 3. 准备数据快照 (Snapshot)
-    // 需要加锁来安全复制当前的位姿估计
-    GICPJob new_job;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
+    // =========================================================================
+    // CASE 2: TRACKING (GICP)
+    // =========================================================================
+    if (state_ == SystemState::TRACKING) {
+      // 1. Check time interval
+      if (current_timestamp - last_tracking_request_time_ <
+          config_.tracking_interval) {
+        return;
+      }
+
+      // 2. Check worker status
+      if (is_gicp_processing_) {
+        return;
+      }
+
+      // 3. Prepare Snapshot
       if (!map_ready_ || !target_tree_)
         return;
 
+      GICPJob new_job;
       new_job.T_map_odom_initial = T_map_odom_;
       new_job.T_odom_lidar_snapshot = T_odom_lidar_;
-      new_job.cloud_odom.reset(new pcl::PointCloud<pcl::PointXYZI>(
-          *input_cloud)); // 深拷贝或引用计数增加
+      new_job.cloud_odom.reset(
+          new pcl::PointCloud<pcl::PointXYZI>(*input_cloud));
       new_job.timestamp = msg.acq_time;
-    }
 
-    // 4. 发送给工作线程
-    {
-      std::lock_guard<std::mutex> lock(job_mutex_);
-      next_job_ = new_job;
-      has_new_job_ = true;
-    }
-    job_cv_.notify_one();
+      // Unlock main mutex before acquiring job mutex to prevent potential
+      // deadlocks (though simple here)
+      lock.unlock();
 
-    last_tracking_request_time_ = current_timestamp;
-    logger->info("[GICP] Triggered tracking task at time {:.2f}",
-                 current_timestamp);
+      // 4. Send to worker
+      {
+        std::lock_guard<std::mutex> job_lock(job_mutex_);
+        next_job_ = new_job;
+        has_new_job_ = true;
+      }
+      job_cv_.notify_one();
+
+      last_tracking_request_time_ = current_timestamp;
+      // logger->info("[GICP] Triggered tracking task at time {:.2f}",
+      // current_timestamp);
+    }
   }
 
 private:
@@ -318,6 +324,7 @@ private:
   bool sc_ready_ = false;
 
   pcl::PointCloud<pcl::PointXYZI>::Ptr global_map_target_;
+  pcl::PointCloud<pcl::PointXYZI>::Ptr debug_cloud;
   pcl::PointCloud<pcl::PointXYZRGB>::Ptr global_map_viz_;
   pcl::PointCloud<pcl::PointCovariance>::Ptr target_covariance_;
   std::shared_ptr<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>
@@ -349,7 +356,6 @@ private:
   // Database Loading (Helpers)
   // =================================================================================
   bool load_sc_database() {
-    // ... (保持原样)
     namespace fs = std::filesystem;
     keyframes_.clear();
     sc_manager_ = std::make_unique<SCManager>();
@@ -412,6 +418,7 @@ private:
       return false;
     }
     pcl::copyPointCloud(*global_map_target_, *global_map_viz_);
+    global_map_viz_->header.frame_id = "map";
 
     logger->info("Processing Global Map for GICP...");
     auto downsampled_map =
@@ -444,67 +451,63 @@ private:
       return;
     }
 
-    Eigen::MatrixXd sc =
-        sc_manager_->makeScancontext(*accumulated_cloud_lidar_);
-    Eigen::MatrixXd ringkey = sc_manager_->makeRingkeyFromScancontext(sc);
-    std::vector<float> query_key = eig2stdvec(ringkey);
-
-    int candidates = std::min((int)keyframes_.size(),
-                              (int)sc_manager_->NUM_CANDIDATES_FROM_TREE);
-    std::vector<size_t> indices(candidates);
-    std::vector<float> dists(candidates);
-    nanoflann::KNNResultSet<float> result_knn(candidates);
-    result_knn.init(&indices[0], &dists[0]);
-    sc_manager_->polarcontext_tree_->index->findNeighbors(
-        result_knn, &query_key[0], nanoflann::SearchParams(10));
-
-    double min_dist = 1e9;
-    int best_idx = -1;
-    int best_align = 0;
-
-    for (int i = 0; i < candidates; ++i) {
-      int map_id = indices[i];
-      auto [dist, align] = sc_manager_->distanceBtnScanContext(
-          sc, sc_manager_->polarcontexts_[map_id]);
-      if (dist < min_dist) {
-        min_dist = dist;
-        best_idx = map_id;
-        best_align = align;
-      }
+    if (required("debug_accumulated_cloud")) {
+      logger->info("[SC Debug] Publishing accumulated cloud...");
+      accumulated_cloud_lidar_->header.frame_id = "odom";
+      send("debug_accumulated_cloud", accumulated_cloud_lidar_, timestamp);
     }
 
-    if (best_idx != -1 && min_dist < config_.sc_dist_thres) {
-      float yaw_diff =
-          (best_align * sc_manager_->PC_UNIT_SECTORANGLE) * M_PI / 180.0f;
+    logger->info("[SC Debug] Accumulated cloud size: {}", 
+                 accumulated_cloud_lidar_->size());
+    
+    pcl::PointXYZI min_pt, max_pt;
+    pcl::getMinMax3D(*accumulated_cloud_lidar_, min_pt, max_pt);
+    logger->info("[SC Debug] Point cloud bounds: X[{:.2f}, {:.2f}], Y[{:.2f}, {:.2f}], Z[{:.2f}, {:.2f}]",
+                 min_pt.x, max_pt.x, min_pt.y, max_pt.y, min_pt.z, max_pt.z);
+    
+    double range = std::sqrt(std::pow(max_pt.x - min_pt.x, 2) + 
+                            std::pow(max_pt.y - min_pt.y, 2));
+    logger->info("[SC Debug] Point cloud span: {:.2f}m", range);
+
+    sc_manager_->SC_DIST_THRES = config_.sc_dist_thres;
+    sc_manager_->makeAndSaveScancontextAndKeys(*accumulated_cloud_lidar_);
+    auto result = sc_manager_->detectLoopClosureID();
+
+    int best_idx = result.first;
+    float yaw_diff_rad = result.second;
+
+    logger->info("[SC] Global Localization Result: Best IDX: {}, Yaw Diff: {:.2f}deg",
+                 best_idx, yaw_diff_rad * 180.0 / M_PI);
+
+    if (best_idx != -1) {
       Eigen::Isometry3d T_map_kf = Eigen::Isometry3d(keyframes_[best_idx].pose);
       Eigen::Isometry3d T_kf_current = Eigen::Isometry3d::Identity();
+
       T_kf_current.rotate(
-          Eigen::AngleAxisd(yaw_diff, Eigen::Vector3d::UnitZ()));
+          Eigen::AngleAxisd(yaw_diff_rad, Eigen::Vector3d::UnitZ()));
+
       Eigen::Isometry3d T_map_lidar_sc = T_map_kf * T_kf_current;
       T_map_odom_ = T_map_lidar_sc * T_odom_lidar_.inverse();
 
       Eigen::Vector3d t = T_map_odom_.translation();
-      logger->info("[SC] SUCCESS | ID: {} | Dist: {:.4f} | T_map_odom: "
-                   "[{:.2f}, {:.2f}, {:.2f}]",
-                   best_idx, min_dist, t.x(), t.y(), t.z());
+      logger->info("[SC] SUCCESS | Matched ID: {} | Yaw Diff: {:.2f}deg | "
+                   "T_map_odom: [{:.2f}, {:.2f}, {:.2f}]",
+                   best_idx, yaw_diff_rad * 180.0 / M_PI, t.x(), t.y(), t.z());
 
       state_ = SystemState::TRACKING;
-
       last_tracking_request_time_ = fins::to_seconds(timestamp);
-
-      if (required("debug_accumulated_cloud")) {
-        pcl::PointCloud<pcl::PointXYZI>::Ptr debug_cloud(
-            new pcl::PointCloud<pcl::PointXYZI>());
-        pcl::transformPointCloud(*accumulated_cloud_lidar_, *debug_cloud,
-                                 T_map_lidar_sc.matrix().cast<float>());
-        debug_cloud->header.frame_id = "map";
-        send("debug_accumulated_cloud", debug_cloud, timestamp);
-      }
     } else {
-      logger->warn("[SC] FAILED | Min Dist: {:.4f}", min_dist);
+      logger->warn("[SC] Global Localization FAILED (Distance > Threshold)");
       accumulated_cloud_lidar_->clear();
       accumulation_started_ = false;
       state_ = SystemState::ACCUMULATING;
+    }
+
+    if (!sc_manager_->polarcontexts_.empty()) {
+      sc_manager_->polarcontexts_.pop_back();
+      sc_manager_->polarcontext_invkeys_.pop_back();
+      sc_manager_->polarcontext_vkeys_.pop_back();
+      sc_manager_->polarcontext_invkeys_mat_.pop_back();
     }
   }
 
@@ -706,4 +709,5 @@ private:
 };
 
 EXPORT_NODE(RelocalizationNode)
-DEFINE_PLUGIN_ENTRY()
+
+}
